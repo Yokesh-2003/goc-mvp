@@ -1,32 +1,88 @@
+export const runtime = "nodejs";
+
 import { cookies } from "next/headers";
-import { NextResponse } from "next/server";
-import { generateCodeVerifier, generateCodeChallenge } from "@/lib/pkce";
+import { NextRequest, NextResponse } from "next/server";
+import { createSupabaseServer } from "@/lib/supabase";
 
-export async function GET() {
-  const cookieStore = await cookies(); // ✅ FIX
+export async function GET(req: NextRequest) {
+  try {
+    const supabase = await createSupabaseServer();
+    const cookieStore = await cookies();
 
-  const verifier = generateCodeVerifier();
-  const challenge = generateCodeChallenge(verifier);
+    const url = new URL(req.url);
+    const code = url.searchParams.get("code");
 
-  cookieStore.set({
-    name: "tiktok_code_verifier",
-    value: verifier,
-    httpOnly: true,
-    secure: false, // true only in prod (https)
-    path: "/",
-    maxAge: 300,
-  });
+    if (!code) {
+      return NextResponse.redirect(
+        new URL("/?error=missing_code", url.origin)
+      );
+    }
 
-  const params = new URLSearchParams({
-    client_key: process.env.TIKTOK_CLIENT_ID!,
-    response_type: "code",
-    scope: "user.info.basic,video.list",
-    redirect_uri: "http://localhost:3000/api/auth/tiktok/callback",
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-  });
+    const verifier = cookieStore.get("tiktok_code_verifier")?.value;
+    if (!verifier) {
+      return NextResponse.redirect(
+        new URL("/?error=missing_verifier", url.origin)
+      );
+    }
 
-  return NextResponse.redirect(
-    `https://www.tiktok.com/v2/auth/authorize?${params.toString()}`
-  );
+    const tokenRes = await fetch(
+      "https://open.tiktokapis.com/v2/oauth/token/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          client_key: process.env.TIKTOK_CLIENT_ID!, // ✅ FIXED
+          client_secret: process.env.TIKTOK_CLIENT_SECRET!,
+          code,
+          grant_type: "authorization_code",
+          redirect_uri: process.env.TIKTOK_REDIRECT_URI!,
+          code_verifier: verifier,
+        }),
+      }
+    );
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenRes.ok || !tokenData.access_token) {
+      console.error("TikTok token error:", tokenData);
+      return NextResponse.redirect(
+        new URL("/?error=token_failed", url.origin)
+      );
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser();
+
+    if (userError || !user) {
+      return NextResponse.redirect(
+        new URL("/?error=unauthorized", url.origin)
+      );
+    }
+
+    await supabase.from("creator_accounts").upsert({
+      user_id: user.id,
+      platform: "tiktok",
+      platform_user_id: tokenData.open_id,
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expires_at: new Date(Date.now() + tokenData.expires_in * 1000),
+    });
+
+    const response = NextResponse.redirect(
+      new URL("/dashboard", url.origin)
+    );
+
+    response.cookies.delete("tiktok_code_verifier");
+
+    return response;
+  } catch (error) {
+    console.error("TikTok OAuth fatal error:", error);
+    return NextResponse.redirect(
+      new URL("/?error=server_error", new URL(req.url).origin)
+    );
+  }
 }
